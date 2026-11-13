@@ -1,0 +1,84 @@
+{
+  "allowed_robot_modes": [
+    "standing"
+  ],
+  "category": "basic",
+  "description": "",
+  "entry_pose": [
+    0.230696,
+    0.268123,
+    -0.060952,
+    0.825318,
+    -0.002601,
+    0.0,
+    0.0,
+    0.245581,
+    -0.263749,
+    0.071342,
+    0.771964,
+    0.004422,
+    0.0,
+    0.0
+  ],
+  "exit_pose": [
+    0.230696,
+    0.268123,
+    -0.060952,
+    0.825318,
+    -0.002601,
+    0.0,
+    0.0,
+    0.245581,
+    -0.263749,
+    0.071342,
+    0.771964,
+    0.004422,
+    0.0,
+    0.0
+  ],
+  "file_format_version": 1,
+  "interruptible": true,
+  "joint_count": 14,
+  "joint_names": [
+    "left_shoulder_pitch",
+    "left_shoulder_roll",
+    "left_shoulder_yaw",
+    "left_elbow",
+    "left_wrist_roll",
+    "left_wrist_pitch",
+    "left_wrist_yaw",
+    "right_shoulder_pitch",
+    "right_shoulder_roll",
+    "right_shoulder_yaw",
+    "right_elbow",
+    "right_wrist_roll",
+    "right_wrist_pitch",
+    "right_wrist_yaw"
+  ],
+  "keyframe_times_ms": [
+    0
+  ],
+  "label": "neutral",
+  "loopable": false,
+  "movement_context": "stationary",
+  "name": "neutral",
+  "nominal_duration_ms": 0,
+  "notes": "",
+  "robot_model": "G1-7DOF",
+  "safety": {
+    "joint_limits_profile": "config/arm_joint_limits.json",
+    "max_acceleration_rad_s2": 0.8,
+    "max_velocity_rad_s": 0.4
+  },
+  "scenes": [
+    "basic"
+  ],
+  "schema_version": 3,
+  "sha256": "4d9ebe7eb140dd7df2ac2d6388165714791f33bd6dcfd8eff019cff5b2180c3d",
+  "source": "teach_with_name",
+  "status": "approved",
+  "type": "pose",
+  "verified_at": "2026-11-12T15:36:05+08:00",
+  "verified_by": "kwx",
+  "version": 1
+}

@@ -1,6 +1,13 @@
 build/
 logs/
 *.dat
+!motions/*.dat
+!motions/**/*.dat
+!poses/**/*.dat
+!tests/fixtures/*.dat
+__pycache__/
+*.pyc
+/Testing/
 *.o
 *.a
 *.so
@@ -8,3 +15,25 @@ logs/
 .idea/
 *.swp
 .DS_Store
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.local
+*.local.json
+*.local.yaml
+*.local.yml
+
+# Local environments and runtime artifacts
+.venv/
+venv/
+.pytest_cache/
+*.log
+*.pid
+*.sock

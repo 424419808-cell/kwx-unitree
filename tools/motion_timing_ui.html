@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>动作时间轴 | G1 导览动作库</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, "Noto Sans CJK SC", sans-serif; color: #172023; background: #f5f7f6; }
+    * { box-sizing: border-box; letter-spacing: 0; }
+    body { margin: 0; }
+    header { background: #163a38; color: #fff; padding: 18px max(20px, calc((100vw - 1120px)/2)); display: flex; align-items: baseline; gap: 18px; }
+    header strong { font-size: 18px; } header span { color: #b7d2ca; font-size: 13px; }
+    main { max-width: 1120px; margin: 0 auto; padding: 26px 20px 60px; }
+    .top { display: flex; align-items: end; gap: 24px; flex-wrap: wrap; border-bottom: 1px solid #d7dfdd; padding-bottom: 20px; }
+    label { display: grid; gap: 7px; font-size: 13px; font-weight: 600; color: #475c59; }
+    select, input[type=number] { min-height: 38px; border: 1px solid #b8c9c5; border-radius: 4px; padding: 6px 10px; background: white; color: #172023; font: inherit; }
+    select { min-width: min(290px, 80vw); }
+    h1 { margin: 26px 0 7px; font-size: 24px; } h2 { margin: 0 0 16px; font-size: 16px; }
+    .muted { color: #60736f; font-size: 13px; line-height: 1.55; }
+    .metrics { display: flex; gap: 30px; flex-wrap: wrap; margin: 18px 0 28px; }
+    .metric { display: grid; gap: 3px; } .metric b { font-size: 18px; font-variant-numeric: tabular-nums; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 34px; align-items: start; }
+    .timeline { border-top: 1px solid #d7dfdd; }
+    .segment { display: grid; grid-template-columns: 95px minmax(80px, 1fr) 86px 65px; align-items: center; gap: 12px; padding: 13px 0; border-bottom: 1px solid #d7dfdd; }
+    .segment .frame { font-size: 13px; font-weight: 600; }
+    .segment input:disabled { opacity: .6; cursor: not-allowed; }
+    .segment small { color: #60736f; font-variant-numeric: tabular-nums; text-align: right; }
+    input[type=range] { width: 100%; accent-color: #147c71; cursor: pointer; }
+    .segment input[type=number] { width: 100%; min-width: 0; text-align: right; }
+    aside { border-left: 1px solid #d7dfdd; padding-left: 25px; }
+    aside label { margin-bottom: 17px; } aside input[type=number] { width: 100%; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0; }
+    button { min-height: 40px; padding: 8px 14px; border-radius: 4px; border: 1px solid #aec5bf; background: #fff; color: #173d37; font: inherit; font-weight: 600; cursor: pointer; }
+    button:hover { background: #e4efeb; } button:disabled { opacity: .5; cursor: not-allowed; }
+    button.primary { background: #147c71; border-color: #147c71; color: white; } button.primary:hover { background: #0e655b; }
+    button.danger { color: #a53426; border-color: #d9b6ae; }
+    .status { min-height: 55px; padding: 12px; border-left: 3px solid #147c71; background: #e8f2ee; color: #1b4b44; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+    .status.error { border-color: #b54432; background: #fae9e5; color: #852c20; }
+    .check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 4px 0; }
+    .check input { accent-color: #147c71; }
+    .mode { border: 0; padding: 0; margin: 0 0 17px; }
+    .mode legend { font-size: 13px; font-weight: 600; color: #475c59; margin-bottom: 7px; }
+    .mode div { display: flex; }
+    .mode label { display: block; margin: 0; flex: 1; }
+    .mode input { position: absolute; opacity: 0; }
+    .mode span { display: block; text-align: center; padding: 8px 10px; border: 1px solid #b8c9c5; background: #fff; color: #173d37; cursor: pointer; }
+    .mode label:first-child span { border-radius: 4px 0 0 4px; }
+    .mode label:last-child span { border-radius: 0 4px 4px 0; border-left: 0; }
+    .mode input:checked + span { background: #147c71; border-color: #147c71; color: #fff; }
+    .mode input:focus-visible + span { outline: 2px solid #173d37; outline-offset: 2px; }
+    .mode input:disabled + span { opacity: .5; cursor: not-allowed; }
+    @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid #d7dfdd; padding: 22px 0 0; } .segment { grid-template-columns: 68px minmax(60px, 1fr) 70px 52px; gap: 7px; } .segment .frame { font-size: 11px; } header { display: block; } header span { display: block; margin-top: 3px; } }
+  </style>
+</head>
+<body>
+<header><strong>G1 导览动作库</strong><span>动作时间轴</span></header>
+<main>
+  <div class="top"><label>动作<select id="motion"></select></label><span id="identity" class="muted"></span></div>
+  <h1 id="title">选择动作</h1><div id="summary" class="muted"></div>
+  <div class="metrics"><div class="metric"><span class="muted">关键帧</span><b id="frames">—</b></div><div class="metric"><span class="muted">当前比例</span><b id="ratio">—</b></div><div class="metric"><span class="muted">核心请求 / 核心规划</span><b id="core">—</b></div><div class="metric"><span class="muted">动作段规划</span><b id="planned">—</b></div></div>
+  <div class="layout"><section><h2>帧间比例</h2><div id="timeline" class="timeline"></div></section>
+    <aside><h2>本次试播</h2>
+      <label id="durationRow">动作核心总时长（毫秒）<input id="duration" type="number" min="1" max="120000" step="100" value="2000"></label>
+      <fieldset class="mode"><legend>试播方式</legend><div><label><input type="radio" name="interpolation" value="quintic" checked><span>平滑</span></label><label><input type="radio" name="interpolation" value="linear"><span>原版线性</span></label></div></fieldset>
+      <label>入口过渡（毫秒）<input id="transition" type="number" min="1" max="30000" step="100" value="1500"></label>
+      <label>末帧保持（毫秒）<input id="hold" type="number" min="0" max="60000" step="100" value="500"></label>
+      <label class="check"><input id="offline" type="checkbox">离线演练</label>
+      <div class="row"><button id="preview" class="primary">真机试播</button><button id="cancel" class="danger" disabled>取消</button></div>
+      <div class="row"><button id="save">保存比例</button></div>
+      <div id="status" class="status" role="status">等待选择动作</div>
+      <div class="row"><button id="shutdown" class="danger">关闭网页服务</button></div>
+    </aside></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let detail = null, weights = [], tested = false, busy = false, savedWeights = [], planDirty = true;
+async function api(path, data) {
+  const response = await fetch(path, data === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+  const body = await response.json();
+  if (!response.ok) throw Error(body.error || '请求失败');
+  return body;
+}
+function notice(message, error=false) { $('status').textContent=message; $('status').className='status'+(error?' error':''); }
+function invalidatePlan() { planDirty=true; $('core').textContent='—'; $('planned').textContent='—'; }
+function ratioText(values) { const sum=values.reduce((a,b)=>a+b,0); return values.map(v=>(100*v/sum).toFixed(1)+'%').join(' / '); }
+function draw() {
+  $('timeline').replaceChildren();
+  if (!detail) return;
+  $('frames').textContent=detail.frames;
+  $('ratio').textContent=weights.length ? ratioText(weights) : '静态姿态';
+  $('save').textContent=detail.frames===1?'确认试播':'保存比例';
+  $('save').disabled=busy || (detail.frames===1 ? !tested : (!tested && weights.every((v,i)=>Math.abs(v-savedWeights[i])<0.00001)));
+  $('preview').disabled=busy;
+  $('preview').textContent=$('offline').checked?'离线演练':'真机试播';
+  $('cancel').disabled=!busy;
+  $('shutdown').disabled=busy;
+  $('motion').disabled=busy;
+  $('offline').disabled=busy;
+  for (const id of ['duration','transition','hold']) $(id).disabled=busy;
+  document.querySelectorAll('input[name="interpolation"]').forEach(input=>input.disabled=busy);
+  $('identity').textContent=detail.category+' · '+detail.type+' · '+detail.status;
+  $('title').textContent=detail.name;
+  $('summary').textContent=weights.length>1 ? '调整各段相对权重。保存只更新比例；右侧总时长只用于本次试播。' : weights.length ? '该动作只有一段，帧间比例固定为100%。' : '单帧动作从当前姿态平滑过渡到录制目标，可调整过渡与保持时间试播。';
+  $('durationRow').hidden=detail.frames===1;
+  if (!weights.length) { const p=document.createElement('p'); p.className='muted'; p.textContent='该动作只有一个目标帧，无帧间比例。'; $('timeline').append(p); return; }
+  weights.forEach((value,i)=>{
+    const row=document.createElement('div'); row.className='segment';
+    const frame=document.createElement('span'); frame.className='frame'; frame.textContent=`${i+1} → ${i+2}`;
+    const slider=document.createElement('input'); slider.type='range'; slider.min='0.05'; slider.max='20'; slider.step='0.05'; slider.value=value;
+    const number=document.createElement('input'); number.type='number'; number.min='0.05'; number.max='20'; number.step='0.05'; number.value=value.toFixed(2);
+    slider.disabled=busy||weights.length===1; number.disabled=busy||weights.length===1;
+    const share=document.createElement('small'); share.textContent=(100*value/weights.reduce((a,b)=>a+b,0)).toFixed(1)+'%';
+    const update=raw=>{ const next=Number(raw); if (!Number.isFinite(next)||next<0.05||next>20) return; weights[i]=next; slider.value=next; number.value=next.toFixed(2); tested=false; invalidatePlan(); $('ratio').textContent=ratioText(weights); [...document.querySelectorAll('.segment small')].forEach((el,j)=>el.textContent=(100*weights[j]/weights.reduce((a,b)=>a+b,0)).toFixed(1)+'%'); $('save').disabled=busy||weights.every((v,j)=>Math.abs(v-savedWeights[j])<0.00001); };
+    slider.addEventListener('input',()=>update(slider.value)); number.addEventListener('change',()=>update(number.value));
+    row.append(frame,slider,number,share); $('timeline').append(row);
+  });
+}
+function trialDefaults() {
+  const linear=document.querySelector('input[name="interpolation"]:checked').value==='linear';
+  $('duration').value=linear ? Math.max(1,detail.frames-1)*300 : Math.max(1000,detail.nominal_ms||2000);
+  $('transition').value=linear ? 300 : 1500;
+  invalidatePlan();
+}
+async function select(name) {
+  try { detail=await api('/api/motion?name='+encodeURIComponent(name));
+    const mean=detail.intervals_ms.reduce((a,b)=>a+b,0)/(detail.intervals_ms.length||1);
+    weights=detail.intervals_ms.map(v=>Number((v/mean).toFixed(3))); savedWeights=[...weights]; tested=false;
+    trialDefaults(); draw(); notice('已载入动作');
+  } catch(error) { notice(error.message,true); }
+}
+function settings() { return {name:detail.name, weights:[...weights], duration_ms:Number($('duration').value), transition_ms:Number($('transition').value), hold_ms:Number($('hold').value), interpolation:document.querySelector('input[name="interpolation"]:checked').value, offline:$('offline').checked}; }
+$('preview').onclick=async()=>{ try { if (!detail) return; await api('/api/preview',settings()); busy=true; tested=false; invalidatePlan(); planDirty=false; draw(); notice('正在启动试播'); } catch(error) { notice(error.message,true); } };
+$('cancel').onclick=async()=>{ try { await api('/api/cancel',{}); notice('正在取消并释放控制权'); } catch(error) { notice(error.message,true); } };
+$('shutdown').onclick=async()=>{ try { await api('/api/shutdown',{}); document.querySelectorAll('button').forEach(button=>button.disabled=true); notice('网页服务已关闭'); } catch(error) { notice(error.message,true); } };
+$('save').onclick=async()=>{ try { const result=await api('/api/save',{name:detail.name,weights,sha256:detail.sha256}); await select(detail.name); notice(result.confirmed ? (result.changed?'比例已保存，试播结果已确认':'试播结果已确认') : result.changed?'比例已保存；请按新比例试播确认':'比例未变化'); } catch(error) { notice(error.message,true); } };
+$('motion').onchange=()=>select($('motion').value);
+$('offline').onchange=draw;
+for (const id of ['duration','transition','hold']) $(id).addEventListener('input',invalidatePlan);
+document.querySelectorAll('input[name="interpolation"]').forEach(input=>input.addEventListener('change',()=>{ if(detail) trialDefaults(); }));
+setInterval(async()=>{ try { const state=await api('/api/status'); if (busy!==state.running) { busy=state.running; tested=state.eligible; draw(); } if (!planDirty && state.planned_seconds>0) { $('planned').textContent=state.planned_seconds.toFixed(2)+' s'; if (state.requested_core_seconds!=null && state.planned_core_seconds!=null) $('core').textContent=state.requested_core_seconds.toFixed(2)+' s / '+state.planned_core_seconds.toFixed(2)+' s'; } if (state.message && (busy||state.phase==='completed'||state.phase==='failed')) { const limited=!planDirty && state.phase==='completed' && state.requested_core_seconds!=null && state.planned_core_seconds>state.requested_core_seconds+0.02; notice(limited ? state.message+'；核心运动因限速延长至 '+state.planned_core_seconds.toFixed(2)+' 秒' : state.message,state.phase==='failed'); } } catch(_) {} },500);
+(async()=>{ try { const {items}=await api('/api/motions'); items.forEach(item=>{ const option=document.createElement('option'); option.value=item.name; option.textContent=item.name+' · '+item.type; $('motion').append(option); }); if (items.length) await select(items[0].name); else notice('尚无已录制动作',true); } catch(error) { notice(error.message,true); } })();
+</script>
+</body>
+</html>

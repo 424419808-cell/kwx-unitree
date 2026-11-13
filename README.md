@@ -102,13 +102,16 @@ sudo systemctl disable --now g1-arm7-watchdog   # 停用开机自启
 
 ### 拳击模式（状态机示例）
 
-`play_with_motions` 是一个在 `play` 基础上加了**状态机**的示例，用来做连招（拳击 / 技能）。
+导览动作库的命名、元数据和离线校验见 [动作库说明](docs/motion-library.md)。
+站立转腰与手势同步的独立示例见 [站立转腰 + 手势示例](docs/standing-waist-gesture-demo.md)。
+四段动作标签与播放中独立更新腰部角度的接口见 [动作标签接口](docs/action-sequence-interface.md)。
 
-**先用 `teach_with_name` 录制动作文件**（保存到 `motions/<名字>.dat`，每段默认 0.3s）：
+`play_with_motions` 是旧的拳击状态机示例，仍读取平铺 `motions/*.dat`，不经过导览动作库元数据门禁。下面的旧示例文件名不在新的 22 动作清单内；`teach_with_name` 现在只录制导览清单中的动作，静态姿态保存到 `poses/basic/`，动态动作保存到 `motions/<类别>/`。导览播放请使用 `motion_library_server`，并在停稳后显式接管、行走前显式释放上半身控制。
+
+**旧拳击示例所需文件**（平铺 `motions/<名字>.dat`，每段默认 0.3s）：
 
 ```bash
-./teach_with_name
-# Enter 记录 → q → 输入名字 (如 guard / punch_left / punch_right / skill_y / skill_a)
+# 当前导览录制器不接受这些旧拳击动作名。
 ```
 
 需要至少录好这些：
@@ -252,13 +255,12 @@ sudo systemctl disable --now g1-arm7-watchdog   # undo auto-start
 
 ### Boxing mode (state-machine demo)
 
-`play_with_motions` is a state-machine demo on top of `play` for combos (boxing / skills).
+`play_with_motions` is a legacy boxing demo. It reads flat `motions/*.dat` files without the guide library metadata gate. Use `motion_library_server` for guide actions.
 
-**First, record motion files with `teach_with_name`** (saved under `motions/<name>.dat`, 0.3s per segment by default):
+**Legacy boxing example files** (flat `motions/<name>.dat`, 0.3s per segment). The current `teach_with_name` accepts only guide catalog names and saves poses under `poses/basic/` and dynamic motions under `motions/<category>/`:
 
 ```bash
-./teach_with_name
-# Enter to record → q → type a name (e.g. guard / punch_left / punch_right / skill_y / skill_a)
+# The guide recorder does not accept these legacy boxing names.
 ```
 
 Expected files:
