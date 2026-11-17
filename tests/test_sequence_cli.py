@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import signal
 import socket
 import subprocess
 import sys
@@ -122,23 +123,168 @@ class SequenceCliTest(unittest.TestCase):
         self.assertIn("core planned 1 s", plans[0])
         self.assertIn("core planned 5 s", plans[1])
 
+    def test_total_ms_uses_saved_profile_and_user_minimum(self):
+        path = self.metadata / "greet_open.json"
+        meta = json.loads(path.read_text())
+        meta["timing_profile"] = {
+            "phase_weights": {"transition": 1, "core": 4, "hold": 1},
+            "minimum_total_ms": 12000, "frame_weights": [1, 3],
+        }
+        path.write_text(json.dumps(meta))
+        for total, expected in ((6000, 12), (24000, 24)):
+            self.sequence.write_text(yaml.safe_dump({
+                "sequence_name": "timed", "steps": [
+                    {"type": "motion", "name": "greet_open", "total_ms": total}],
+            }))
+            checked = self.check()
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertIn(f"{expected} s", checked.stdout)
+            preview = subprocess.run([
+                sys.executable, str(TOOL), "preview", "greet_open", "--check",
+                "--total-ms", str(total), "--limits", str(self.limits),
+                "--catalog", str(self.catalog), "--dir", str(self.motions),
+                "--poses", str(self.poses), "--metadata", str(self.metadata),
+            ], capture_output=True, text=True)
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            self.assertIn(f"total planned {expected} s", preview.stdout)
+
+    def test_total_ms_requires_profile_and_rejects_mixed_phase_times(self):
+        for step in (
+            {"type": "motion", "name": "greet_open", "total_ms": 6000},
+            {"type": "motion", "name": "greet_open", "total_ms": 6000, "hold_ms": 100},
+        ):
+            self.sequence.write_text(yaml.safe_dump({"sequence_name": "invalid", "steps": [step]}))
+            self.assertNotEqual(self.check().returncode, 0)
+
+    def test_unsaved_profile_offline_preview_uses_uniform_timing(self):
+        profile = {"phase_weights": {"transition": 1, "core": 2, "hold": 1},
+                   "minimum_total_ms": 1000, "frame_weights": [1, 1]}
+        result = subprocess.run([
+            sys.executable, str(TOOL), "preview", "greet_open", "--offline", "--json-events",
+            "--total-ms", "100", "--timing-profile-json", json.dumps(profile),
+            "--limits", str(self.limits), "--catalog", str(self.catalog),
+            "--dir", str(self.motions), "--poses", str(self.poses),
+            "--metadata", str(self.metadata),
+        ], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in result.stdout.splitlines()
+                  if line.startswith('{"event": "preview"')]
+        running = next(event["preview"] for event in events if event["preview"]["state"] == "running")
+        self.assertAlmostEqual(running["planned_seconds"], 1)
+        self.assertAlmostEqual(running["planned_core_seconds"], running["planned_seconds"] / 2)
+        self.assertEqual(events[-1]["ownership"], "released")
+        self.assertNotIn("timing_profile", json.loads((self.metadata / "greet_open.json").read_text()))
+
+    def combo_fixture(self):
+        entries = motion_library.catalog_entries(self.catalog)
+        path = motion_library.asset_path(entries["present_right"], self.motions, self.poses)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("1\n14\n0.3 0.03 " + " ".join(["0"] * 13) + "\n")
+        points, errors, _ = motion_library.parse_motion(path)
+        self.assertFalse(errors)
+        motion_library.write_meta(self.metadata / "present_right.json", motion_library.metadata_for(
+            entries["present_right"], path, points))
+        for name in ("neutral", "greet_open", "present_right"):
+            meta_path = self.metadata / f"{name}.json"
+            meta = json.loads(meta_path.read_text())
+            meta.update(status="draft", verified_by="", verified_at="")
+            meta["timing_profile"] = {
+                "phase_weights": {"transition": 1, "core": 2 if name == "greet_open" else 0, "hold": 1},
+                "minimum_total_ms": 200, "frame_weights": [1, 3] if name == "greet_open" else [],
+            }
+            meta_path.write_text(json.dumps(meta))
+        sequence = {"sequence_name": "fixture_combo", "steps": [
+            {"type": entries[name]["type"], "name": name, "total_ms": 100}
+            for name in ("neutral", "greet_open", "neutral", "present_right", "neutral")
+        ]}
+        self.sequence.write_text(json.dumps(sequence))
+
+    def combo_command(self, mode, *extra):
+        return [
+            sys.executable, str(TOOL), "preview", "fixture_combo", "--sequence-file", str(self.sequence),
+            mode, "--json-events", "--limits", str(self.limits), "--catalog", str(self.catalog),
+            "--dir", str(self.motions), "--poses", str(self.poses), "--metadata", str(self.metadata), *extra,
+        ]
+
+    def run_combo(self, mode, *extra):
+        return subprocess.run(self.combo_command(mode, *extra), capture_output=True, text=True, timeout=30)
+
+    def test_combo_draft_actions_run_continuously_and_release_once(self):
+        self.combo_fixture()
+        before = {path.name: path.read_bytes() for path in self.metadata.glob("*.json")}
+        checked = self.run_combo("--check")
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("total planned 1 s", checked.stdout)
+        self.assertIn("return directly to startup pose", checked.stdout)
+        result = self.run_combo("--offline")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"event": "preview"')]
+        self.assertEqual(events[-1]["ownership"], "released")
+        self.assertEqual(events[-1]["preview"]["name"], "fixture_combo")
+        indices = {event.get("active_step_index") for event in events}
+        self.assertTrue(set(range(5)).issubset(indices), indices)
+        self.assertEqual(before, {path.name: path.read_bytes() for path in self.metadata.glob("*.json")})
+
+    def test_combo_rejects_missing_profile_before_any_execution(self):
+        self.combo_fixture()
+        path = self.metadata / "present_right.json"
+        meta = json.loads(path.read_text())
+        del meta["timing_profile"]
+        path.write_text(json.dumps(meta))
+        result = self.run_combo("--check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("saved timing profile", result.stderr)
+
+    def test_combo_cancellation_exits_and_releases_offline_session(self):
+        self.combo_fixture()
+        sequence = json.loads(self.sequence.read_text())
+        for step in sequence["steps"]:
+            step["total_ms"] = 2000
+        self.sequence.write_text(json.dumps(sequence))
+        log_path = self.root / "combo-output.txt"
+        with log_path.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(self.combo_command("--offline"), stdout=output,
+                                       stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 8
+                while True:
+                    lines = log_path.read_text().splitlines()
+                    events = [json.loads(line) for line in lines
+                              if line.startswith('{"event": "preview"') and line.endswith('}')]
+                    if any(event["preview"]["state"] == "running" for event in events):
+                        break
+                    self.assertIsNone(process.poll(), lines)
+                    self.assertLess(time.monotonic(), deadline, lines)
+                    time.sleep(0.05)
+                process.send_signal(signal.SIGINT)
+                _, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 130, errors)
+                self.assertIn("取消试播并释放控制权", errors)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
+
     def test_play_style_preview_honors_requested_time_and_supports_single_frame(self):
-        def check(name, interpolation):
+        def check(name, interpolation=None):
             return subprocess.run([
                 sys.executable, str(TOOL), "preview", name, "--check",
-                "--duration-ms", "20", "--interpolation", interpolation,
+                "--duration-ms", "20",
                 "--limits", str(self.limits), "--catalog", str(self.catalog),
                 "--dir", str(self.motions), "--poses", str(self.poses),
                 "--metadata", str(self.metadata),
-            ], cwd=ROOT, capture_output=True, text=True, check=False)
+            ] + (["--interpolation", interpolation] if interpolation is not None else []),
+                cwd=ROOT, capture_output=True, text=True, check=False)
 
-        smooth = check("greet_open", "quintic")
+        removed = check("greet_open", "quintic")
         linear = check("greet_open", "linear")
-        self.assertEqual(smooth.returncode, 0, smooth.stderr)
+        self.assertNotEqual(removed.returncode, 0)
         self.assertEqual(linear.returncode, 0, linear.stderr)
         self.assertIn("core requested 0.02 s, core planned 0.02 s", linear.stdout)
         self.assertIn("Play-style linear preview: 2 ms commands", linear.stdout)
-        self.assertNotEqual(smooth.stdout, linear.stdout)
+        default = check("greet_open")
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertEqual(default.stdout, linear.stdout)
         neutral = check("neutral", "linear")
         self.assertEqual(neutral.returncode, 0, neutral.stderr)
 

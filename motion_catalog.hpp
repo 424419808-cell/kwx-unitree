@@ -3,6 +3,7 @@
 #include "standing_motion.hpp"
 
 #include <array>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -113,6 +114,62 @@ inline std::string sha256_file(const std::string& path) {
     return result.str();
 }
 
+struct TimingProfile {
+    bool enabled = false;
+    double transition = 0;
+    double core = 0;
+    double hold = 0;
+    int minimum_total_ms = 0;
+    std::vector<double> frame_weights;
+
+    double weight_sum() const { return transition + core + hold; }
+
+    static TimingProfile parse(const nlohmann::json& input, size_t frames) {
+        if (!input.is_object() || input.size() != 3)
+            throw std::runtime_error("timing_profile needs phase_weights, minimum_total_ms, frame_weights");
+        TimingProfile profile;
+        auto integer = [&](const char* key, int low, int high) {
+            if (!input.contains(key) || !input.at(key).is_number_integer())
+                throw std::runtime_error(std::string("invalid timing_profile field: ") + key);
+            const auto value = input.at(key).get<int64_t>();
+            if (value < low || value > high)
+                throw std::runtime_error(std::string("timing_profile field outside range: ") + key);
+            return static_cast<int>(value);
+        };
+        if (!input.contains("phase_weights") || !input.at("phase_weights").is_object() ||
+            input.at("phase_weights").size() != 3)
+            throw std::runtime_error("phase_weights needs transition, core, hold");
+        const auto& phases = input.at("phase_weights");
+        auto weight = [&](const char* key, bool positive) {
+            if (!phases.contains(key) || !phases.at(key).is_number())
+                throw std::runtime_error(std::string("invalid phase weight: ") + key);
+            const double value = phases.at(key).get<double>();
+            if (!std::isfinite(value) || value < 0 || value > 10000 ||
+                (value > 0 && value < 0.000001) || (positive && value == 0))
+                throw std::runtime_error(std::string("phase weight outside range: ") + key);
+            return value;
+        };
+        profile.transition = weight("transition", true);
+        profile.core = weight("core", frames > 1);
+        profile.hold = weight("hold", false);
+        if (frames == 1 && profile.core != 0)
+            throw std::runtime_error("single-frame actions must have zero core weight");
+        profile.minimum_total_ms = integer("minimum_total_ms", 1, 600000);
+        if (!input.contains("frame_weights") || !input.at("frame_weights").is_array() ||
+            input.at("frame_weights").size() != (frames >= 3 ? frames - 1 : 0))
+            throw std::runtime_error("frame weights are editable only for motions with at least 3 frames");
+        for (const auto& item : input.at("frame_weights")) {
+            if (!item.is_number()) throw std::runtime_error("frame weight must be numeric");
+            const double weight = item.get<double>();
+            if (!std::isfinite(weight) || weight < 0.05 || weight > 20)
+                throw std::runtime_error("frame weight outside [0.05, 20]");
+            profile.frame_weights.push_back(weight);
+        }
+        profile.enabled = true;
+        return profile;
+    }
+};
+
 struct Asset {
     Entry entry;
     std::vector<standing_motion::Waypoint> waypoints;
@@ -122,6 +179,7 @@ struct Asset {
     bool interruptible = true;
     double max_velocity = standing_motion::kMaxArmVelocity;
     double max_acceleration = standing_motion::kMaxArmAcceleration;
+    TimingProfile timing_profile;
 };
 
 struct Library {
@@ -238,6 +296,9 @@ struct Library {
                     throw std::runtime_error("motion safety limits exceed controller limits: " + name);
                 asset.loopable = meta.at("loopable").get<bool>();
                 asset.interruptible = meta.at("interruptible").get<bool>();
+                if (meta.contains("timing_profile"))
+                    asset.timing_profile = TimingProfile::parse(
+                        meta.at("timing_profile"), asset.waypoints.size());
             } else if (require_v3) {
                 throw std::runtime_error("sequence requires v3 metadata: " + name);
             }

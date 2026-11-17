@@ -76,9 +76,18 @@
   "schema_version": 3,
   "sha256": "4d9ebe7eb140dd7df2ac2d6388165714791f33bd6dcfd8eff019cff5b2180c3d",
   "source": "teach_with_name",
-  "status": "approved",
+  "status": "draft",
   "type": "pose",
-  "verified_at": "2026-11-12T15:36:05+08:00",
-  "verified_by": "kwx",
-  "version": 1
+  "verified_at": "",
+  "verified_by": "",
+  "version": 2,
+  "timing_profile": {
+    "phase_weights": {
+      "transition": 1,
+      "core": 0,
+      "hold": 1
+    },
+    "minimum_total_ms": 1000,
+    "frame_weights": []
+  }
 }

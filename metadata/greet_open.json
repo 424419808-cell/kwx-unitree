@@ -81,5 +81,14 @@
   "type": "motion",
   "verified_at": "",
   "verified_by": "",
-  "version": 2
+  "version": 3,
+  "timing_profile": {
+    "phase_weights": {
+      "transition": 1,
+      "core": 2,
+      "hold": 1
+    },
+    "minimum_total_ms": 2000,
+    "frame_weights": []
+  }
 }

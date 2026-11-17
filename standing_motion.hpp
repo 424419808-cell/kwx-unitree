@@ -17,24 +17,22 @@ constexpr double kMaxArmVelocity = 0.4;   // Conservative demo limits, not hardw
 constexpr double kMaxArmAcceleration = 0.8;
 constexpr double kMaxYawVelocity = 0.15;
 constexpr double kMaxYawAcceleration = 0.3;
-constexpr double kQuinticPeakVelocity = 1.875;
-constexpr double kQuinticPeakAcceleration = 5.773503;
 
 using ArmPose = std::array<double, kArmJoints>;
 
-enum class Interpolation { Quintic, Linear, PlayLinear };
+enum class Interpolation { PlayLinear };
 
 struct Waypoint {
     double requested_duration;
     ArmPose arm;
-    Interpolation interpolation = Interpolation::Quintic;
+    Interpolation interpolation = Interpolation::PlayLinear;
 };
 
 struct Segment {
     double duration;
     ArmPose from;
     ArmPose to;
-    Interpolation interpolation = Interpolation::Quintic;
+    Interpolation interpolation = Interpolation::PlayLinear;
 };
 
 struct Plan {
@@ -89,9 +87,8 @@ inline std::vector<Waypoint> load_motion(const std::string& path) {
     return points;
 }
 
-inline double minimum_duration(double displacement, double velocity, double acceleration) {
-    return std::max(kQuinticPeakVelocity * displacement / velocity,
-                    std::sqrt(kQuinticPeakAcceleration * displacement / acceleration));
+inline double minimum_duration(double displacement, double velocity, double) {
+    return displacement / velocity;
 }
 
 inline Plan make_plan(const ArmPose& start, double yaw_start, double yaw_target,
@@ -103,44 +100,27 @@ inline Plan make_plan(const ArmPose& start, double yaw_start, double yaw_target,
     ArmPose from = start;
     for (const Waypoint& point : points) {
         double duration = point.requested_duration;
-        if (point.interpolation != Interpolation::PlayLinear) {
-            for (size_t i = 0; i < kArmJoints; ++i) {
-                const double displacement = std::abs(point.arm[i] - from[i]);
-                duration = std::max(duration, point.interpolation == Interpolation::Linear ?
-                    displacement / kMaxArmVelocity :
-                    minimum_duration(displacement, kMaxArmVelocity, kMaxArmAcceleration));
-            }
-        }
         plan.segments.push_back({duration, from, point.arm, point.interpolation});
         plan.total_duration += duration;
         from = point.arm;
     }
-    const double yaw_duration = minimum_duration(
-        std::abs(yaw_target - yaw_start), kMaxYawVelocity, kMaxYawAcceleration);
-    if (plan.total_duration < yaw_duration) {
-        const double scale = yaw_duration / plan.total_duration;
-        for (Segment& segment : plan.segments) segment.duration *= scale;
-        plan.total_duration = yaw_duration;
-    }
     return plan;
 }
 
-inline double quintic(double phase) {
-    phase = std::max(0.0, std::min(1.0, phase));
-    return phase * phase * phase * (10.0 + phase * (-15.0 + 6.0 * phase));
+inline double linear_phase(double phase) {
+    return std::max(0.0, std::min(1.0, phase));
 }
 
 inline Sample sample(const Plan& plan, double elapsed) {
     elapsed = std::max(0.0, std::min(plan.total_duration, elapsed));
     Sample result{};
     result.yaw = plan.yaw_from + (plan.yaw_to - plan.yaw_from) *
-                 quintic(elapsed / plan.total_duration);
+                 linear_phase(elapsed / plan.total_duration);
     double remaining = elapsed;
     for (const Segment& segment : plan.segments) {
         if (remaining <= segment.duration || &segment == &plan.segments.back()) {
             const double phase = remaining / segment.duration;
-            const double s = segment.interpolation == Interpolation::Quintic ?
-                quintic(phase) : std::max(0.0, std::min(1.0, phase));
+            const double s = linear_phase(phase);
             for (size_t i = 0; i < kArmJoints; ++i)
                 result.arm[i] = segment.from[i] + (segment.to[i] - segment.from[i]) * s;
             return result;

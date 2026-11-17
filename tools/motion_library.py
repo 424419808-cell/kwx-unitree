@@ -91,6 +91,53 @@ def timing(points):
     return times
 
 
+def validate_timing_profile(profile, frames):
+    fields = {"phase_weights", "minimum_total_ms", "frame_weights"}
+    if type(profile) is not dict or set(profile) != fields:
+        raise ValueError("完整时间配置字段无效")
+    phases = profile["phase_weights"]
+    if type(phases) is not dict or set(phases) != {"transition", "core", "hold"}:
+        raise ValueError("完整动作比例须包含transition、core、hold")
+    for key in ("transition", "core", "hold"):
+        value = phases[key]
+        positive = key == "transition" or (key == "core" and frames > 1)
+        if (type(value) not in (int, float) or not math.isfinite(value) or
+                not 0 <= value <= 10000 or (0 < value < 0.000001) or (positive and value == 0)):
+            raise ValueError("非零比例须在0.000001到10000之间；入口与多帧核心不能为0")
+    if frames == 1 and phases["core"] != 0:
+        raise ValueError("单帧动作的核心比例须为0")
+    if type(profile["minimum_total_ms"]) is not int or not 1 <= profile["minimum_total_ms"] <= 600000:
+        raise ValueError("最短总时长须为1到600000的整数毫秒")
+    weights = profile["frame_weights"]
+    if type(weights) is not list or len(weights) != (frames - 1 if frames >= 3 else 0) or any(
+            type(value) not in (int, float) or not math.isfinite(value) or
+            not 0.05 <= value <= 20 for value in weights):
+        raise ValueError("仅三帧及以上可设置帧间比例，每项须在0.05到20之间")
+    return dict(profile, phase_weights=dict(phases), frame_weights=list(weights))
+
+
+def save_timing_profile(name, profile, entries, motions, poses, metadata,
+                       expected_sha256, expected_version, confirm_by=None):
+    result, errors, _ = inspect(name, entries, motions, poses, metadata)
+    if errors:
+        raise ValueError("; ".join(errors))
+    points, meta = result
+    if meta["sha256"] != expected_sha256 or meta["version"] != expected_version:
+        raise ValueError("动作或时间配置已变化，请重新载入")
+    profile = validate_timing_profile(profile, len(points))
+    changed = meta.get("timing_profile") != profile
+    if changed:
+        meta = dict(meta, timing_profile=profile, version=meta["version"] + 1,
+                    status="draft", verified_by="", verified_at="")
+    path = metadata / f"{name}.json"
+    if confirm_by:
+        meta = dict(meta, status="approved", verified_by=confirm_by,
+                    verified_at=datetime.now().astimezone().isoformat(timespec="seconds"))
+    if changed or confirm_by:
+        write_meta(path, meta)
+    return meta, changed
+
+
 def metadata_for(entry, path, points, old=None):
     old = old or {}
     return {
@@ -127,6 +174,11 @@ def validate_metadata(path, entry, asset, points):
     if type(meta) is not dict:
         return None, ["元数据必须是对象"]
     errors = []
+    if "timing_profile" in meta:
+        try:
+            validate_timing_profile(meta["timing_profile"], len(points))
+        except ValueError as error:
+            errors.append(str(error))
     schema = meta.get("schema_version")
     if schema not in (2, 3):
         errors.append("schema_version必须是2或3")

@@ -70,14 +70,11 @@ int main() {
         const double right = standing_motion::sample(plan, elapsed + 1e-5).arm[0];
         require(std::abs(left - right) < 1e-4);
     }
-    const double dt = 0.002;
-    for (double time = dt; time < plan.total_duration - dt; time += dt) {
-        const double before = standing_motion::sample(plan, time - dt).arm[0];
-        const double current = standing_motion::sample(plan, time).arm[0];
-        const double after = standing_motion::sample(plan, time + dt).arm[0];
-        require(std::abs((after - before) / (2 * dt)) <= standing_motion::kMaxArmVelocity + 0.01);
-        require(std::abs((after - 2 * current + before) / (dt * dt)) <=
-                standing_motion::kMaxArmAcceleration + 0.05);
+    double segment_start = 0;
+    for (const auto& segment : plan.segments) {
+        require(std::abs(standing_motion::sample(plan, segment_start + segment.duration * 0.25).arm[0] -
+            (segment.from[0] + (segment.to[0] - segment.from[0]) * 0.25)) < 1e-9);
+        segment_start += segment.duration;
     }
     require(std::abs(standing_motion::sample(plan, plan.total_duration).arm[0]) < 1e-9);
 
@@ -91,8 +88,60 @@ int main() {
     require(std::abs(weighted_action.waypoints[1].requested_duration - 1.0) < 1e-9);
     require(std::abs(weighted_action.waypoints[2].requested_duration - 3.0) < 1e-9);
 
+    auto profiled = weighted;
+    auto& timed = profiled.steps.front();
+    timed.duration_ms = 0;
+    timed.preview_weights.clear();
+    timed.total_ms = 6000;
+    timed.timing_profile = motion_catalog::TimingProfile::parse(nlohmann::json::parse(R"({
+      "phase_weights":{"transition":1,"core":4,"hold":1},
+      "minimum_total_ms":12000,"frame_weights":[1,3]
+    })"), 3);
+    const auto timed_action = sequence_library::resolve(profiled, library, limits, actual, actual, true);
+    require(timed_action.play_style_preview);
+    require(timed_action.waypoints.size() == 4);
+    const std::array<double, 4> expected{{2, 2, 6, 2}};
+    for (size_t i = 0; i < expected.size(); ++i)
+        require(std::abs(timed_action.waypoints[i].requested_duration - expected[i]) < 1e-9);
+    auto nearby_measured = actual;
+    nearby_measured[0] = 0.01;
+    const auto tracked_timing = sequence_library::resolve(
+        profiled, library, limits, actual, nearby_measured, true);
+    require(tracked_timing.waypoints.size() == timed_action.waypoints.size());
+    timed.total_ms = 24000;
+    const auto longer = sequence_library::resolve(profiled, library, limits, actual, actual, true);
+    for (size_t i = 0; i < expected.size(); ++i)
+        require(std::abs(longer.waypoints[i].requested_duration - 2 * expected[i]) < 1e-9);
+    timed.total_ms = 3000;
+    timed.timing_profile.minimum_total_ms = 3000;
+    auto far_start = actual;
+    far_start[0] = -0.9;
+    const auto three_second_action = sequence_library::resolve(
+        profiled, library, limits, far_start, far_start, true);
+    const auto three_second_plan = standing_motion::make_plan(
+        far_start, 0, 0, three_second_action.waypoints);
+    require(std::abs(three_second_plan.total_duration - 3.0) < 1e-9);
+    timed.total_ms = 1;
+    timed.timing_profile.minimum_total_ms = 1;
+    const auto constrained = sequence_library::resolve(profiled, library, limits, actual, actual, true);
+    const auto constrained_plan = standing_motion::make_plan(actual, 0, 0, constrained.waypoints);
+    require(std::abs(constrained_plan.total_duration - 0.001) < 1e-12);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        require(std::abs(constrained.waypoints[i].requested_duration /
+                         constrained.waypoints[0].requested_duration - expected[i] / expected[0]) < 1e-9);
+        require(std::abs(constrained_plan.segments[i].duration -
+                         constrained.waypoints[i].requested_duration) < 1e-9);
+    }
+    require(std::abs(standing_motion::sample(constrained_plan,
+        constrained_plan.segments.front().duration * 0.25).arm[0] - 0.005) < 1e-12);
+    bool mixed_rejected = false;
+    try { sequence_library::parse(nlohmann::json::parse(R"({
+      "sequence_name":"mixed","steps":[{"type":"motion","name":"greet_open",
+      "total_ms":6000,"duration_ms":1000}]})")); }
+    catch (const std::runtime_error&) { mixed_rejected = true; }
+    require(mixed_rejected);
+
     weighted.steps.front().duration_ms = 20;
-    weighted.steps.front().preview_linear = true;
     const auto linear_action = sequence_library::resolve(
         weighted, library, limits, actual, actual, true);
     require(linear_action.play_style_preview);
@@ -106,10 +155,9 @@ int main() {
                                                        linear_action.waypoints);
     require(std::abs(linear_plan.segments[1].duration - 0.005) < 1e-9);
     require(std::abs(linear_plan.segments[2].duration - 0.015) < 1e-9);
-    bool preview_only = false;
-    try { sequence_library::resolve(weighted, library, limits, actual); }
-    catch (const std::runtime_error&) { preview_only = true; }
-    require(preview_only);
+    const auto formal_linear = sequence_library::resolve(weighted, library, limits, actual);
+    const auto formal_plan = standing_motion::make_plan(actual, 0, 0, formal_linear.waypoints);
+    require(std::abs(formal_plan.segments[1].duration - 0.005) < 1e-9);
 
     standing_motion::ArmPose measured{};
     measured[0] = 0.02;

@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -34,7 +35,7 @@ class App:
         self.tested = None
 
     def detail(self, name):
-        if name not in self.entries:
+        if type(name) is not str or name not in self.entries:
             raise ValueError("动作名不在清单中")
         result, errors, warnings = library.inspect(
             name, self.entries, ROOT / "motions", ROOT / "poses", ROOT / "metadata")
@@ -42,44 +43,89 @@ class App:
             raise ValueError("; ".join(errors))
         points, meta = result
         intervals = [round(value * 1000) for value, _ in points[1:]]
+        mean = sum(intervals) / len(intervals) if intervals else 1
+        profile = meta.get("timing_profile", {
+            "phase_weights": {"transition": 1, "core": 2 if intervals else 0, "hold": 1},
+            "minimum_total_ms": 3000,
+            "frame_weights": [value / mean for value in intervals] if len(points) >= 3 else [],
+        })
         return {"name": name, "type": self.entries[name]["type"],
                 "category": self.entries[name]["category"], "status": meta["status"],
-                "sha256": meta["sha256"], "frames": len(points),
+                "sha256": meta["sha256"], "version": meta["version"], "frames": len(points),
+                "timing_profile": profile, "profile_saved": "timing_profile" in meta,
                 "intervals_ms": intervals, "nominal_ms": sum(intervals),
                 "warnings": warnings}
 
     def preview(self, payload):
         name = payload.get("name")
         detail = self.detail(name)
-        weights = payload.get("weights", [])
-        if detail["intervals_ms"]:
-            self.check_weights(weights, len(detail["intervals_ms"]))
-        elif weights:
-            raise ValueError("单帧动作没有帧间比例")
-        duration = (self.check_int(payload.get("duration_ms"), 1, 120000, "试播总时长")
-                    if detail["intervals_ms"] else 0)
-        hold = self.check_int(payload.get("hold_ms"), 0, 60000, "末帧保持")
-        transition = self.check_int(payload.get("transition_ms"), 1, 30000, "入口过渡")
+        if payload.get("sha256") != detail["sha256"] or payload.get("version") != detail["version"]:
+            raise ValueError("动作或时间配置已变化，请重新载入")
+        profile = library.validate_timing_profile(payload.get("timing_profile"), detail["frames"])
+        total = self.check_int(payload.get("total_ms"), 1, 600000, "高层请求总时长")
         offline = payload.get("offline", False)
         if type(offline) is not bool:
             raise ValueError("离线选项无效")
-        interpolation = payload.get("interpolation", "quintic")
-        if interpolation not in ("quintic", "linear"):
-            raise ValueError("核心插值选项无效")
         binary = ROOT / "build/motion_library_server"
         if not binary.is_file():
             raise ValueError("请先构建 motion_library_server")
         cmd = [sys.executable, str(ROOT / "tools/motion_ctl.py"), "preview", name,
-               "--no-confirm", "--json-events",
-               "--hold-ms", str(hold), "--transition-ms", str(transition)]
-        if duration:
-            cmd += ["--duration-ms", str(duration)]
-        if weights:
-            cmd += ["--weights-json", json.dumps(weights)]
-        if interpolation == "linear":
-            cmd += ["--interpolation", "linear"]
+               "--no-confirm", "--json-events", "--total-ms", str(total),
+               "--timing-profile-json", json.dumps(profile)]
         if offline:
             cmd.append("--offline")
+        signature = (name, detail["sha256"], detail["version"], profile, total)
+        requested_core = max(total, profile["minimum_total_ms"]) / 1000 * \
+            profile["phase_weights"]["core"] / sum(profile["phase_weights"].values())
+        self.launch(cmd, signature, offline, requested_core=requested_core)
+
+    def combo_plan(self, payload):
+        steps = payload.get("steps")
+        if type(steps) is not list or not 1 <= len(steps) <= 64:
+            raise ValueError("组合须包含1到64个动作")
+        sequence = {"sequence_name": "web_combo", "steps": []}
+        planned_steps = []
+        for index, step in enumerate(steps):
+            if type(step) is not dict or set(step) != {"name", "total_ms"}:
+                raise ValueError("组合步骤须包含动作名和总时长")
+            detail = self.detail(step["name"])
+            if not detail["profile_saved"]:
+                raise ValueError(f"第{index + 1}步 {detail['name']} 尚未保存比例与最短时间")
+            total = self.check_int(step["total_ms"], 1, 600000, f"第{index + 1}步总时长")
+            minimum = detail["timing_profile"]["minimum_total_ms"]
+            sequence["steps"].append({"type": detail["type"], "name": detail["name"], "total_ms": total})
+            planned_steps.append({"name": detail["name"], "total_ms": total,
+                                  "minimum_total_ms": minimum, "planned_ms": max(total, minimum)})
+        return {"sequence": sequence, "steps": planned_steps,
+                "requested_ms": sum(step["total_ms"] for step in planned_steps),
+                "planned_ms": sum(step["planned_ms"] for step in planned_steps)}
+
+    def preview_combo(self, payload):
+        plan = self.combo_plan(payload)
+        offline = payload.get("offline", False)
+        if type(offline) is not bool:
+            raise ValueError("离线选项无效")
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="g1-combo-",
+                                             suffix=".json", delete=False) as stream:
+                path = Path(stream.name)
+                json.dump(plan["sequence"], stream, ensure_ascii=False)
+            cmd = [sys.executable, str(ROOT / "tools/motion_ctl.py"), "preview", "web_combo",
+                   "--sequence-file", str(path), "--no-confirm", "--json-events"]
+            if offline:
+                cmd.append("--offline")
+            self.launch(cmd, None, offline, mode="combo", steps=plan["steps"], cleanup_path=path)
+        except Exception:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            raise
+        return plan
+
+    def launch(self, cmd, signature, offline, requested_core=None,
+               mode="single", steps=None, cleanup_path=None):
+        if not (ROOT / "build/motion_library_server").is_file():
+            raise ValueError("请先构建 motion_library_server")
         with self.lock:
             if self.stopping:
                 raise ValueError("网页服务正在关闭")
@@ -88,7 +134,8 @@ class App:
             self.tested = None
             self.state = {"running": True, "phase": "starting", "planned_seconds": None,
                           "planned_core_seconds": None,
-                          "requested_core_seconds": duration / 1000 if duration else None,
+                          "requested_core_seconds": requested_core,
+                          "mode": mode, "steps": steps or [], "active_step_index": None,
                           "message": "正在启动试播", "success": False, "eligible": False}
             try:
                 self.process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
@@ -97,10 +144,9 @@ class App:
             except OSError:
                 self.state["running"] = False
                 raise
-            threading.Thread(target=self.watch, args=(self.process, name, detail["sha256"],
-                                                     list(weights), offline), daemon=True).start()
+            threading.Thread(target=self.watch, args=(self.process, signature, offline, cleanup_path), daemon=True).start()
 
-    def watch(self, process, name, sha256, weights, offline):
+    def watch(self, process, signature, offline, cleanup_path=None):
         lines = []
         for line in process.stdout:
             line = line.strip()
@@ -116,6 +162,7 @@ class App:
                     self.state["phase"] = preview.get("state", "running")
                     self.state["planned_seconds"] = preview.get("planned_seconds")
                     self.state["planned_core_seconds"] = preview.get("planned_core_seconds")
+                    self.state["active_step_index"] = event.get("active_step_index")
                     self.state["message"] = preview.get("error") or self.state["phase"]
                 else:
                     lines.append(line)
@@ -123,13 +170,15 @@ class App:
         code = process.wait()
         with self.lock:
             success = code == 0 and self.state["phase"] == "completed"
-            self.state.update(running=False, success=success, eligible=success and not offline,
+            self.state.update(running=False, success=success, eligible=success and not offline and signature is not None,
                               phase="completed" if success else "failed",
                               message="试播完成，控制权已释放" if success else
                                       (lines[-1] if lines else f"试播失败，退出码 {code}"))
-            if success and not offline:
-                self.tested = (name, sha256, weights)
+            if success and not offline and signature is not None:
+                self.tested = signature
             self.process = None
+        if cleanup_path is not None:
+            cleanup_path.unlink(missing_ok=True)
 
     def cancel(self):
         with self.lock:
@@ -143,30 +192,17 @@ class App:
     def save(self, payload):
         name = payload.get("name")
         detail = self.detail(name)
-        weights = payload.get("weights")
-        self.check_weights(weights, len(detail["intervals_ms"]))
-        if payload.get("sha256") != detail["sha256"]:
-            raise ValueError("动作文件已变化，请重新载入")
+        profile = library.validate_timing_profile(payload.get("timing_profile"), detail["frames"])
+        total = self.check_int(payload.get("total_ms"), 1, 600000, "高层请求总时长")
         with self.lock:
             if self.stopping:
                 raise ValueError("网页服务正在关闭")
             if self.state["running"]:
                 raise ValueError("试播运行时不能保存")
-            confirmed = self.tested == (name, detail["sha256"], weights)
-            if detail["frames"] == 1:
-                if not confirmed:
-                    raise ValueError("单帧动作须完成真机试播后确认")
-                result, errors, _ = library.inspect(
-                    name, self.entries, ROOT / "motions", ROOT / "poses", ROOT / "metadata")
-                if errors:
-                    raise ValueError("; ".join(errors))
-                meta = library.confirm_metadata(ROOT / "metadata" / f"{name}.json",
-                                                result[1], getpass.getuser())
-                changed = False
-            else:
-                meta, changed = library.save_timing(
-                    name, weights, self.entries, ROOT / "motions", ROOT / "poses",
-                    ROOT / "metadata", getpass.getuser() if confirmed else None)
+            confirmed = self.tested == (name, payload.get("sha256"), payload.get("version"), profile, total)
+            meta, changed = library.save_timing_profile(
+                name, profile, self.entries, ROOT / "motions", ROOT / "poses", ROOT / "metadata",
+                payload.get("sha256"), payload.get("version"), getpass.getuser() if confirmed else None)
             self.tested = None
         return {"changed": changed, "confirmed": confirmed and meta["status"] == "approved",
                 "status": meta["status"]}
@@ -176,14 +212,6 @@ class App:
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"{label}须为{low}到{high}的整数毫秒")
         return value
-
-    @staticmethod
-    def check_weights(weights, count):
-        if not isinstance(weights, list) or len(weights) != count or any(
-                type(value) not in (float, int) or not 0.05 <= value <= 20
-                for value in weights):
-            raise ValueError("帧间比例数量或取值无效")
-
 
 APP = App()
 
@@ -214,8 +242,14 @@ class Handler(BaseHTTPRequestHandler):
                 for name, entry in APP.entries.items():
                     path = library.asset_path(entry, ROOT / "motions", ROOT / "poses")
                     if path.is_file():
-                        items.append({"name": name, "type": entry["type"],
-                                      "category": entry["category"]})
+                        item = {"name": name, "type": entry["type"], "category": entry["category"]}
+                        try:
+                            detail = APP.detail(name)
+                            item.update(profile_saved=detail["profile_saved"],
+                                        minimum_total_ms=detail["timing_profile"]["minimum_total_ms"])
+                        except (OSError, ValueError) as error:
+                            item.update(profile_saved=False, error=str(error))
+                        items.append(item)
                 self.reply(200, {"items": items})
             elif url.path == "/api/motion":
                 self.reply(200, APP.detail(parse_qs(url.query).get("name", [""])[0]))
@@ -245,6 +279,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/preview":
                 APP.preview(payload)
                 result = {"started": True}
+            elif self.path == "/api/combo-plan":
+                result = APP.combo_plan(payload)
+            elif self.path == "/api/combo-preview":
+                result = APP.preview_combo(payload)
             elif self.path == "/api/cancel":
                 APP.cancel()
                 result = {"cancelled": True}

@@ -14,12 +14,13 @@ int main() {
     ArmPose target{};
     target[3] = 1.8;
     const Plan plan = make_plan(start, 0.0, 0.2, {{0.3, target}});
-    require(plan.total_duration >= minimum_duration(1.8, kMaxArmVelocity, kMaxArmAcceleration));
-    require(plan.total_duration >= minimum_duration(0.2, kMaxYawVelocity, kMaxYawAcceleration));
+    require(std::abs(plan.total_duration - 0.3) < 1e-9);
     require(std::abs(sample(plan, 0.0).arm[3]) < 1e-9);
     require(std::abs(sample(plan, 0.0).yaw) < 1e-9);
     require(std::abs(sample(plan, plan.total_duration / 2).arm[3] - 0.9) < 1e-9);
     require(std::abs(sample(plan, plan.total_duration / 2).yaw - 0.1) < 1e-9);
+    require(std::abs(sample(plan, plan.total_duration / 4).arm[3] - 0.45) < 1e-9);
+    require(std::abs(sample(plan, plan.total_duration / 4).yaw - 0.05) < 1e-9);
     require(std::abs(sample(plan, plan.total_duration).arm[3] - 1.8) < 1e-9);
     require(std::abs(sample(plan, plan.total_duration).yaw - 0.2) < 1e-9);
 
@@ -31,11 +32,9 @@ int main() {
 
     ArmPose short_target{};
     short_target[0] = 0.395;
-    const Plan smooth = make_plan(start, 0, 0, {{0.5, short_target}});
     const Plan linear = make_plan(start, 0, 0, {{0.5, short_target,
-        Interpolation::Linear}});
-    require(std::abs(linear.total_duration - 0.395 / kMaxArmVelocity) < 1e-9);
-    require(linear.total_duration < smooth.total_duration);
+        Interpolation::PlayLinear}});
+    require(std::abs(linear.total_duration - 0.5) < 1e-9);
     require(std::abs(sample(linear, linear.total_duration / 2).arm[0] - 0.1975) < 1e-9);
     require(std::abs(sample(linear, linear.total_duration).arm[0] - 0.395) < 1e-9);
 

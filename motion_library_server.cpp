@@ -54,7 +54,8 @@ constexpr uint16_t kKeyR2 = 1u << 4;
 constexpr double kPi = 3.141592653589793;
 constexpr double kMaxYawDegrees = 15.0;
 constexpr double kMaxAbsoluteYaw = 0.40;
-constexpr auto kTick = std::chrono::milliseconds(10);
+constexpr auto kTick = std::chrono::milliseconds(2);
+constexpr auto kOwnershipTick = std::chrono::milliseconds(10);
 constexpr auto kPlayTick = std::chrono::milliseconds(2);
 constexpr char kSocketName[] = "g1_arm_motion_library";
 
@@ -210,7 +211,7 @@ bool ramp_up(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
         }
         weight = static_cast<double>(i + 1) / 200;
         publish(publisher, cmd, initial, initial.arm, initial.yaw, weight);
-        wake += kTick;
+        wake += kOwnershipTick;
         std::this_thread::sleep_until(wake);
     }
     return true;
@@ -228,7 +229,7 @@ void ramp_down(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
     for (int i = 0; i < 200; ++i) {
         publish(publisher, cmd, initial, arm, yaw,
                 starting_weight * (1.0 - static_cast<double>(i + 1) / 200));
-        wake += kTick;
+        wake += kOwnershipTick;
         std::this_thread::sleep_until(wake);
     }
     publish(publisher, cmd, initial, arm, yaw, 0.0);
@@ -237,12 +238,17 @@ void ramp_down(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
 enum class Kind { Action, Sequence, Preview, Answer, Waist, Interrupt, Resume, Stop, Release, Acquire, Quit };
 
 struct Command {
+    bool combo_preview = false;
     Kind kind;
     action_sequence::Resolved action;
     sequence_library::Definition sequence;
     sequence_library::JointLimits limits;
     double yaw_degrees = 0.0;
 };
+
+std::string preview_label(const Command& command) {
+    return command.combo_preview ? command.sequence.name : command.sequence.steps.front().name;
+}
 
 class CommandQueue {
 public:
@@ -330,6 +336,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = {{"state", names[static_cast<int>(player.state())]},
                    {"checkpoint", checkpoint}, {"ownership", ownership_},
+                   {"active_step_index", player.state() == motion_interrupt::State::Running ?
+                        nlohmann::json(player.active_step_index()) : nlohmann::json(nullptr)},
                    {"preview", preview_}};
     }
 
@@ -347,8 +355,11 @@ sequence_library::Definition preview_definition(const motion_catalog::Asset& ass
     sequence_library::Step step;
     step.type = asset.entry.type;
     step.name = asset.entry.name;
-    step.transition_ms = 1500;
+    step.transition_ms = 300;
     step.hold_ms = 500;
+    if (asset.timing_profile.enabled) {
+        step.total_ms = asset.timing_profile.minimum_total_ms;
+    }
     if (step.type == "motion") {
         if (asset.nominal_duration_ms > 60000)
             throw std::runtime_error("preview motion exceeds 60 s nominal duration");
@@ -362,7 +373,8 @@ double preview_core_seconds(const standing_motion::Plan& plan,
                             const sequence_library::Step& step,
                             const motion_catalog::Asset& asset) {
     const size_t core_count = asset.waypoints.size() - 1;
-    const size_t hold_count = step.hold_ms > 0 ? 1 : 0;
+    const auto& profile = step.timing_profile.enabled ? step.timing_profile : asset.timing_profile;
+    const size_t hold_count = (step.total_ms ? profile.hold : step.hold_ms) > 0 ? 1 : 0;
     if (plan.segments.size() < core_count + hold_count)
         throw std::runtime_error("preview plan is missing core segments");
     const size_t end = plan.segments.size() - hold_count;
@@ -372,10 +384,31 @@ double preview_core_seconds(const standing_motion::Plan& plan,
     return seconds;
 }
 
+double preview_core_seconds(const standing_motion::Plan& plan, const Command& command,
+                            const motion_catalog::Library& library) {
+    if (command.combo_preview) return 0.0;
+    const auto& step = command.sequence.steps.front();
+    return preview_core_seconds(plan, step, library.load_asset(step.name, true, true));
+}
+
 Command parse_command(const nlohmann::json& input, const motion_catalog::Library& library,
                       const std::string& limits_path, double initial_yaw) {
     if (!input.is_object()) throw std::runtime_error("command must be a JSON object");
     Command command{};
+    if (input.contains("组合试播")) {
+        if (input.size() != 1) throw std::runtime_error("combo preview has extra fields");
+        command.kind = Kind::Preview;
+        command.combo_preview = true;
+        command.sequence = sequence_library::parse(input.at("组合试播"));
+        command.limits = sequence_library::JointLimits::for_preview(limits_path);
+        for (const auto& step : command.sequence.steps) {
+            const auto asset = library.load_asset(step.name, true, true);
+            if (!step.total_ms || step.repeat != 1 || asset.entry.type != step.type ||
+                !asset.timing_profile.enabled)
+                throw std::runtime_error("combo preview requires total_ms and a saved timing profile: " + step.name);
+        }
+        return command;
+    }
     if (input.contains("试播")) {
         if (input.size() != 1)
             throw std::runtime_error("preview has extra fields");
@@ -388,7 +421,8 @@ Command parse_command(const nlohmann::json& input, const motion_catalog::Library
             for (auto it = options.begin(); it != options.end(); ++it)
                 if (it.key() != "name" && it.key() != "duration_ms" &&
                     it.key() != "weights" && it.key() != "hold_ms" &&
-                    it.key() != "transition_ms" && it.key() != "interpolation")
+                    it.key() != "transition_ms" && it.key() != "interpolation" &&
+                    it.key() != "total_ms" && it.key() != "timing_profile")
                     throw std::runtime_error("unknown preview option: " + it.key());
         }
         const auto name = detailed ? motion_catalog::required_string(options, "name") :
@@ -398,6 +432,20 @@ Command parse_command(const nlohmann::json& input, const motion_catalog::Library
         command.sequence = preview_definition(asset);
         if (detailed) {
             auto& step = command.sequence.steps.front();
+            const bool legacy = options.contains("duration_ms") || options.contains("hold_ms") ||
+                options.contains("transition_ms") || options.contains("weights") ||
+                options.contains("interpolation");
+            if (legacy) step.total_ms = 0;
+            if (options.contains("total_ms") && legacy)
+                throw std::runtime_error("total_ms cannot be mixed with legacy preview options");
+            step.total_ms = sequence_library::integer_field(
+                options, "total_ms", step.total_ms, 1, 600000);
+            if (options.contains("timing_profile")) {
+                if (!step.total_ms)
+                    throw std::runtime_error("timing_profile override requires total_ms");
+                step.timing_profile = motion_catalog::TimingProfile::parse(
+                    options.at("timing_profile"), asset.waypoints.size());
+            }
             step.duration_ms = sequence_library::integer_field(
                 options, "duration_ms", step.duration_ms, 1, 120000);
             step.hold_ms = sequence_library::integer_field(
@@ -406,13 +454,10 @@ Command parse_command(const nlohmann::json& input, const motion_catalog::Library
                 options, "transition_ms", step.transition_ms, 1, 30000);
             if (options.contains("interpolation")) {
                 if (!options.at("interpolation").is_string())
-                    throw std::runtime_error("preview interpolation must be quintic or linear");
+                    throw std::runtime_error("only linear interpolation is supported");
                 const std::string interpolation = options.at("interpolation").get<std::string>();
-                if (interpolation != "quintic" && interpolation != "linear")
-                    throw std::runtime_error("preview interpolation must be quintic or linear");
-                step.preview_linear = interpolation == "linear";
-                if (step.preview_linear && !options.contains("transition_ms"))
-                    step.transition_ms = 300;
+                if (interpolation != "linear")
+                    throw std::runtime_error("only linear interpolation is supported");
             }
             if (options.contains("weights")) {
                 const auto& weights = options.at("weights");
@@ -564,7 +609,7 @@ private:
                 }
                 const Kind kind = parsed.kind;
                 const std::string preview_name = kind == Kind::Preview ?
-                    parsed.sequence.steps.front().name : "";
+                    preview_label(parsed) : "";
                 const bool preview_limits_verified = kind == Kind::Preview ?
                     parsed.limits.verified : true;
                 if (kind == Kind::Release) status_.set_ownership("releasing");
@@ -649,6 +694,7 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
     bool pending_release = false;
     bool preview_running = false;
     bool play_style_active = false;
+    bool reverse_return_active = false;
     bool owned = start_owned;
     motion_interrupt::Player player(session_initial.arm);
     double yaw_from = session_initial.yaw;
@@ -741,6 +787,7 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
                 }
                 player.reset_idle_pose(acquired.arm);
                 play_style_active = false;
+                reverse_return_active = false;
                 arm_command = acquired.arm;
                 yaw_command = acquired.yaw;
                 yaw_from = yaw_to = saved_yaw_target = acquired.yaw;
@@ -830,10 +877,10 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
         if (owned && (pending_release || pending_quit) &&
             player.state() == motion_interrupt::State::Idle && !yaw_active) {
             arm_command = player.pose();
-            const auto play_return = play_style_active ? player.preview_return_waypoints() :
+            const auto play_return = reverse_return_active ? player.preview_return_waypoints() :
                 std::vector<standing_motion::Waypoint>{};
             if (!return_home(publisher, cmd, session_initial, arm_command, yaw_command,
-                             !operator_preview, play_style_active ? &play_return : nullptr))
+                             !operator_preview, reverse_return_active ? &play_return : nullptr))
                 return false;
             ramp_down(publisher, cmd, session_initial, arm_command, yaw_command, weight);
             weight = 0.0;
@@ -883,12 +930,7 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
                     const auto plan = standing_motion::make_plan(
                         player.pose(), 0.0, 0.0, action.waypoints);
                     double planned_core = 0.0;
-                    if (preview) {
-                        const auto asset = library.load_asset(
-                            queued.sequence.steps.front().name, true, true);
-                        planned_core = preview_core_seconds(
-                            plan, queued.sequence.steps.front(), asset);
-                    }
+                    if (preview) planned_core = preview_core_seconds(plan, queued, library);
                     std::cout << (preview ? "[PREVIEW] " : "[SEQUENCE] ")
                               << queued.sequence.name << " started; "
                               << plan.total_duration << " s planned"
@@ -896,11 +938,12 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
                               << "\n";
                     player.start(action);
                     play_style_active = action.play_style_preview;
+                    reverse_return_active = action.play_style_preview && !queued.combo_preview;
                     wake = std::chrono::steady_clock::now();
                     previous = wake;
                     if (preview) {
                         preview_running = true;
-                        status.set_preview(queued.sequence.steps.front().name, "running", "",
+                        status.set_preview(preview_label(queued), "running", "",
                                            queued.limits.verified, plan.total_duration,
                                            planned_core);
                     }
@@ -920,7 +963,7 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
                 }
             } catch (const std::exception& error) {
                 if (queued.kind == Kind::Preview) {
-                    status.set_preview(queued.sequence.steps.front().name, "rejected", error.what());
+                    status.set_preview(preview_label(queued), "rejected", error.what());
                     pending_release = true;
                     status.set_ownership("releasing");
                 }
@@ -935,11 +978,11 @@ bool control_loop(ChannelPublisher<LowCmd_>& publisher, LowCmd_& cmd,
                 const double progress = std::min(yaw_duration,
                     yaw_brake_start + yaw_brake_duration * (u - u * u / 2));
                 yaw_command = yaw_from + (yaw_to - yaw_from) *
-                              standing_motion::quintic(progress / yaw_duration);
+                              standing_motion::linear_phase(progress / yaw_duration);
                 if (u >= 1.0) { yaw_active = false; yaw_braking = false; }
             } else {
                 yaw_command = yaw_from + (yaw_to - yaw_from) *
-                              standing_motion::quintic(elapsed / yaw_duration);
+                              standing_motion::linear_phase(elapsed / yaw_duration);
                 if (elapsed >= yaw_duration) yaw_active = false;
             }
         }
@@ -1150,16 +1193,23 @@ int main(int argc, char** argv) {
             const auto action = sequence_library::resolve(
                 command.sequence, library, command.limits, start, start, true);
             const auto plan = standing_motion::make_plan(start, 0.0, 0.0, action.waypoints);
-            std::cout << "Preview valid: " << step.name;
-            if (asset.waypoints.size() > 1)
-                std::cout << ", core requested " << step.duration_ms / 1000.0
+            std::cout << "Preview valid: " << preview_label(command);
+            if (!command.combo_preview && asset.waypoints.size() > 1) {
+                const auto& profile = step.timing_profile.enabled ? step.timing_profile : asset.timing_profile;
+                const double requested_core = step.total_ms ?
+                    std::max(step.total_ms, profile.minimum_total_ms) / 1000.0 * profile.core / profile.weight_sum() :
+                    step.duration_ms / 1000.0;
+                std::cout << ", core requested " << requested_core
                           << " s, core planned " << preview_core_seconds(plan, step, asset)
                           << " s";
+            }
             std::cout << ", total planned " << plan.total_duration
                       << " s from entry pose. No robot connection was made.\n";
-            if (step.preview_linear)
+            if (action.play_style_preview)
                 std::cout << "Play-style linear preview: 2 ms commands; requested timing, "
-                             "no velocity/acceleration retiming; reverse the traversed path on return.\n";
+                             "no velocity/acceleration retiming; "
+                          << (command.combo_preview ? "return directly to startup pose.\n" :
+                              "reverse the traversed path on return.\n");
             if (!command.limits.verified)
                 std::cout << "Warning: joint limits unverified; per-joint range was not checked.\n";
             return 0;
@@ -1211,13 +1261,10 @@ int main(int argc, char** argv) {
                                 player.pose(), player.pose(), true);
                             const auto plan = standing_motion::make_plan(
                                 player.pose(), 0.0, 0.0, action.waypoints);
-                            const double planned_core = preview_core_seconds(
-                                plan, command.sequence.steps.front(),
-                                library.load_asset(command.sequence.steps.front().name,
-                                                   true, true));
+                            const double planned_core = preview_core_seconds(plan, command, library);
                             player.start(action);
                             preview_running = true;
-                            status.set_preview(command.sequence.steps.front().name, "running", "",
+                            status.set_preview(preview_label(command), "running", "",
                                                command.limits.verified, plan.total_duration,
                                                planned_core);
                         }
@@ -1228,7 +1275,7 @@ int main(int argc, char** argv) {
                     } catch (const std::exception& error) {
                         if (command.kind == Kind::Acquire) status.set_ownership("released");
                         if (command.kind == Kind::Preview)
-                            status.set_preview(command.sequence.steps.front().name,
+                            status.set_preview(preview_label(command),
                                                "rejected", error.what());
                         if (command.kind == Kind::Preview)
                             status.set_ownership("releasing");

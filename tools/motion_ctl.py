@@ -46,7 +46,16 @@ def preview_server_args(args, socket_name):
 
 
 def preview_payload(args):
+    if args.sequence_file is not None:
+        if any(value is not None for value in (args.total_ms, args.timing_profile_json,
+                args.duration_ms, args.hold_ms, args.transition_ms, args.weights_json, args.interpolation)):
+            raise ValueError("组合文件不能与单动作试播参数混用")
+        return {"组合试播": json.loads(args.sequence_file.read_text(encoding="utf-8"))}
     options = {"name": args.name}
+    if args.total_ms is not None:
+        options["total_ms"] = args.total_ms
+    if args.timing_profile_json is not None:
+        options["timing_profile"] = json.loads(args.timing_profile_json)
     if args.duration_ms is not None:
         options["duration_ms"] = args.duration_ms
     if args.hold_ms is not None:
@@ -55,7 +64,7 @@ def preview_payload(args):
         options["transition_ms"] = args.transition_ms
     if args.weights_json is not None:
         options["weights"] = json.loads(args.weights_json)
-    if args.interpolation != "quintic":
+    if args.interpolation is not None:
         options["interpolation"] = args.interpolation
     return {"试播": options} if len(options) > 1 else {"试播": args.name}
 
@@ -140,17 +149,21 @@ def preview_once(args):
         result = request(socket_name, preview_payload(args))
         if result.get("warning"):
             print("注意：" + result["warning"], file=sys.stderr)
-        deadline = time.monotonic() + 300
+        preview_started = time.monotonic()
+        deadline = preview_started + 300
         last_event = None
         while True:
             if process.poll() is not None:
                 raise RuntimeError(f"试播过程中服务端退出，退出码 {process.returncode}")
             status = request(socket_name, {"状态": True})["status"]
             preview = status.get("preview") or {}
+            if preview.get("planned_seconds", 0) > 0:
+                deadline = max(deadline, preview_started + preview["planned_seconds"] + 120)
             event = (preview.get("state"), status.get("ownership"),
-                     preview.get("planned_seconds"), preview.get("error"))
+                     preview.get("planned_seconds"), preview.get("error"), status.get("active_step_index"))
             if args.json_events and event != last_event:
                 print(json.dumps({"event": "preview", "preview": preview,
+                                  "active_step_index": status.get("active_step_index"),
                                   "ownership": status.get("ownership")},
                                  ensure_ascii=False), flush=True)
             last_event = event
@@ -158,7 +171,7 @@ def preview_once(args):
                 raise RuntimeError("试播未完成：" + (preview.get("error") or preview["state"]))
             if preview.get("state") == "completed" and status["ownership"] == "released":
                 print(f"试播完成：{args.name}；上半身控制权已释放")
-                if not args.offline and not args.no_confirm:
+                if not args.offline and not args.no_confirm and args.timing_profile_json is None and args.sequence_file is None:
                     try:
                         answer = input("确认这个动作可用并录入动作库？[y/N]: ").strip().lower()
                     except EOFError:
@@ -215,6 +228,7 @@ def main():
     sequence.add_argument("--metadata", type=Path, default=ROOT / "metadata")
     preview = commands.add_parser("preview", help="单次试播或复查一个已录制动作")
     preview.add_argument("name", help="动作清单中的名称，如 neutral")
+    preview.add_argument("--sequence-file", type=Path, help="组合试播的 Sequence JSON 文件；全组只接管和释放一次")
     preview_mode = preview.add_mutually_exclusive_group()
     preview_mode.add_argument("--check", action="store_true", help="只做离线校验，不连接机器人")
     preview_mode.add_argument("--offline", action="store_true", help="离线演练完整流程，不连接机器人")
@@ -225,11 +239,13 @@ def main():
     preview.add_argument("--poses", type=Path, default=ROOT / "poses")
     preview.add_argument("--metadata", type=Path, default=ROOT / "metadata")
     preview.add_argument("--duration-ms", type=int, help="本次试播的动作核心总时长")
+    preview.add_argument("--total-ms", type=int, help="入口、核心、保持的完整总时长，按已保存比例规划")
+    preview.add_argument("--timing-profile-json", help="本次未保存的比例配置 JSON；试播不会自动确认元数据")
     preview.add_argument("--hold-ms", type=int, help="本次试播的末帧保持时长")
     preview.add_argument("--transition-ms", type=int, help="本次试播的入口过渡时长")
     preview.add_argument("--weights-json", help="本次试播各帧间权重的 JSON 数组")
-    preview.add_argument("--interpolation", choices=("quintic", "linear"), default="quintic",
-                         help="linear 按原版 play 的 2 ms 线性指令执行，按请求时长播放，不做速度/加速度扩时")
+    preview.add_argument("--interpolation", choices=("linear",),
+                         help="仅支持原版 play 线性插值；默认已启用，无需指定")
     preview.add_argument("--no-confirm", action="store_true", help="非交互试播，不更新确认状态")
     preview.add_argument("--json-events", action="store_true", help="向标准输出发送试播状态事件")
     answer = commands.add_parser("answer", help="暂停后执行回答手势，保留原讲解断点")

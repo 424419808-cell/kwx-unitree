@@ -72,7 +72,8 @@ struct Step {
     int transition_ms = 500;
     int repeat = 1;
     std::vector<double> preview_weights;
-    bool preview_linear = false;
+    int total_ms = 0;
+    motion_catalog::TimingProfile timing_profile;
 };
 
 struct Definition {
@@ -85,10 +86,10 @@ inline int integer_field(const nlohmann::json& object, const char* key,
     if (!object.contains(key)) return fallback;
     if (!object.at(key).is_number_integer())
         throw std::runtime_error(std::string("sequence field must be integer: ") + key);
-    const int value = object.at(key).get<int>();
+    const auto value = object.at(key).get<int64_t>();
     if (value < minimum || value > maximum)
         throw std::runtime_error(std::string("sequence field outside range: ") + key);
-    return value;
+    return static_cast<int>(value);
 }
 
 inline Definition parse(const nlohmann::json& input) {
@@ -111,17 +112,46 @@ inline Definition parse(const nlohmann::json& input) {
             throw std::runtime_error("invalid sequence step type or name");
         for (auto it = item.begin(); it != item.end(); ++it)
             if (it.key() != "type" && it.key() != "name" && it.key() != "duration_ms" &&
-                it.key() != "hold_ms" && it.key() != "transition_ms" && it.key() != "repeat")
+                it.key() != "hold_ms" && it.key() != "transition_ms" && it.key() != "repeat" &&
+                it.key() != "total_ms")
                 throw std::runtime_error("unknown sequence step field: " + it.key());
         step.duration_ms = integer_field(item, "duration_ms", 0, 0, 120000);
         step.hold_ms = integer_field(item, "hold_ms", 0, 0, 60000);
         step.transition_ms = integer_field(item, "transition_ms", 500, 0, 30000);
         step.repeat = integer_field(item, "repeat", 1, 1, 10);
+        step.total_ms = integer_field(item, "total_ms", 0, 1, 600000);
+        if (step.total_ms && (item.contains("duration_ms") || item.contains("hold_ms") ||
+                              item.contains("transition_ms") || step.repeat != 1))
+            throw std::runtime_error("total_ms cannot be mixed with legacy phase times or repeat > 1");
         if (step.type == "pose" && (step.duration_ms != 0 || step.repeat != 1))
             throw std::runtime_error("pose step cannot set duration_ms or repeat");
         definition.steps.push_back(step);
     }
     return definition;
+}
+
+inline void append_timed_step(action_sequence::Resolved& result,
+                             const motion_catalog::Asset& asset,
+                             const JointLimits& limits,
+                             const motion_catalog::TimingProfile& profile,
+                             int requested_ms, standing_motion::ArmPose& previous) {
+    if (!profile.enabled) throw std::runtime_error("total_ms requires a saved timing_profile");
+    const double total = std::max(requested_ms, profile.minimum_total_ms) / 1000.0;
+    const double unit = total / profile.weight_sum();
+    auto append = [&](double duration, const standing_motion::ArmPose& target) {
+        limits.check(target);
+        result.waypoints.push_back({duration, target, standing_motion::Interpolation::PlayLinear});
+        previous = target;
+    };
+    append(profile.transition * unit, asset.waypoints.front().arm);
+    const double sum = std::accumulate(profile.frame_weights.begin(), profile.frame_weights.end(), 0.0);
+    for (size_t i = 1; i < asset.waypoints.size(); ++i) {
+        const double share = profile.frame_weights.empty() ?
+            static_cast<double>(asset.keyframe_times_ms[i] - asset.keyframe_times_ms[i - 1]) /
+                asset.nominal_duration_ms : profile.frame_weights[i - 1] / sum;
+        append(profile.core * unit * share, asset.waypoints[i].arm);
+    }
+    if (profile.hold) append(profile.hold * unit, previous);
 }
 
 inline action_sequence::Resolved resolve(const Definition& definition,
@@ -134,31 +164,37 @@ inline action_sequence::Resolved resolve(const Definition& definition,
     limits.check(actual);
     action_sequence::Resolved result;
     result.request.label = definition.name;
-    for (const auto& step : definition.steps) {
-        if (step.preview_linear && !allow_preview)
-            throw std::runtime_error("play-style interpolation is only available in preview");
-        result.play_style_preview = result.play_style_preview || step.preview_linear;
-    }
+    result.play_style_preview = allow_preview;
     double tracking_gap = 0;
     for (size_t joint = 0; joint < standing_motion::kArmJoints; ++joint)
         tracking_gap = std::max(tracking_gap, std::abs(actual[joint] - commanded[joint]));
     if (tracking_gap > 0.03)
         throw std::runtime_error("arm has not settled at commanded pose");
-    if (tracking_gap > 1e-6 && !result.play_style_preview) {
-        double duration = 0.5;
-        for (size_t joint = 0; joint < standing_motion::kArmJoints; ++joint)
-            duration = std::max(duration, standing_motion::minimum_duration(
-                std::abs(actual[joint] - commanded[joint]),
-                standing_motion::kMaxArmVelocity, standing_motion::kMaxArmAcceleration));
-        result.waypoints.push_back({duration, actual});
+    const bool timed_entry = !definition.steps.empty() && definition.steps.front().total_ms > 0;
+    if (tracking_gap > 1e-6 && !result.play_style_preview && !timed_entry) {
+        result.waypoints.push_back({0.5, actual});
     }
-    standing_motion::ArmPose previous = result.play_style_preview ? commanded : actual;
+    standing_motion::ArmPose previous = (result.play_style_preview || timed_entry) ? commanded : actual;
     for (const Step& step : definition.steps) {
         const auto asset = library.load_asset(step.name, true, allow_preview);
         result.brake_max_velocity = std::min(result.brake_max_velocity, asset.max_velocity);
         result.brake_max_acceleration = std::min(result.brake_max_acceleration, asset.max_acceleration);
         if (step.type != asset.entry.type || (step.repeat > 1 && !asset.loopable))
             throw std::runtime_error("sequence step type or loop policy mismatch: " + step.name);
+        if (step.total_ms) {
+            if (step.repeat != 1 || !step.preview_weights.empty())
+                throw std::runtime_error("total_ms uses profile timing and a single execution");
+            if (step.timing_profile.enabled && !allow_preview)
+                throw std::runtime_error("timing profile overrides are only allowed in preview");
+            const auto& profile = step.timing_profile.enabled ? step.timing_profile : asset.timing_profile;
+            append_timed_step(result, asset, limits, profile, step.total_ms, previous);
+            result.sequence_step_end.push_back(result.waypoints.size());
+            result.sequence_step_names.push_back(step.name);
+            result.sequence_step_interruptible.push_back(asset.interruptible);
+            result.sequence_step_max_velocity.push_back(asset.max_velocity);
+            result.sequence_step_max_acceleration.push_back(asset.max_acceleration);
+            continue;
+        }
         const int core_ms = step.duration_ms ? step.duration_ms : asset.nominal_duration_ms;
         const bool target_motion = step.type == "motion" && asset.waypoints.size() == 1;
         if (step.type == "motion" && !target_motion && core_ms <= 0)
@@ -184,15 +220,7 @@ inline action_sequence::Resolved resolve(const Definition& definition,
                 if (transition_ms == 0)
                     throw std::runtime_error("nonzero transition cannot take 0 ms: " + step.name);
                 double duration = transition_ms / 1000.0;
-                if (!step.preview_linear) {
-                    for (size_t joint = 0; joint < standing_motion::kArmJoints; ++joint)
-                        duration = std::max(duration, standing_motion::minimum_duration(
-                            std::abs(anchor[joint] - previous[joint]),
-                            asset.max_velocity, asset.max_acceleration));
-                }
-                result.waypoints.push_back({duration, anchor, step.preview_linear ?
-                    standing_motion::Interpolation::PlayLinear :
-                    standing_motion::Interpolation::Quintic});
+                result.waypoints.push_back({duration, anchor});
             }
             previous = anchor;
             for (size_t i = 1; i < asset.waypoints.size(); ++i) {
@@ -205,15 +233,7 @@ inline action_sequence::Resolved resolve(const Definition& definition,
                     duration = core_ms * step.preview_weights[i - 1] /
                                preview_weight_total / 1000.0;
                 }
-                if (!step.preview_linear) {
-                    for (size_t joint = 0; joint < standing_motion::kArmJoints; ++joint)
-                        duration = std::max(duration, standing_motion::minimum_duration(
-                            std::abs(frame[joint] - previous[joint]),
-                            asset.max_velocity, asset.max_acceleration));
-                }
-                result.waypoints.push_back({duration, frame,
-                    step.preview_linear ? standing_motion::Interpolation::PlayLinear :
-                                          standing_motion::Interpolation::Quintic});
+                result.waypoints.push_back({duration, frame});
                 previous = frame;
             }
         }

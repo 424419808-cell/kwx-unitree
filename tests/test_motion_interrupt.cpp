@@ -53,7 +53,7 @@ int main() {
     require(std::abs(player.pose()[0] - 0.4) < 1e-9);
     auto linear = action(0.2);
     for (auto& waypoint : linear.waypoints)
-        waypoint.interpolation = standing_motion::Interpolation::Linear;
+        waypoint.interpolation = standing_motion::Interpolation::PlayLinear;
     player.start(linear);
     player.tick(0.3);
     const double linear_before = player.pose()[0];

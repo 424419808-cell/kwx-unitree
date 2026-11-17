@@ -29,6 +29,13 @@ public:
     bool has_checkpoint() const { return has_checkpoint_; }
     Checkpoint checkpoint() const { return checkpoint_; }
     double brake_duration() const { return brake_duration_; }
+    size_t active_step_index() const {
+        size_t step = 0;
+        const size_t waypoint = current_waypoint();
+        while (step + 1 < action_.sequence_step_end.size() &&
+               waypoint >= action_.sequence_step_end[step]) ++step;
+        return step;
+    }
 
     std::vector<standing_motion::Waypoint> preview_return_waypoints() const {
         if (!action_.play_style_preview)
@@ -170,21 +177,11 @@ private:
             for (size_t index = 0; index < plan.segments.size(); ++index) {
                 const auto& segment = plan.segments[index];
                 if (remaining < segment.duration || index + 1 == plan.segments.size()) {
-                    const double phase = std::min(1.0, remaining / segment.duration);
-                    const bool linear = segment.interpolation ==
-                        standing_motion::Interpolation::Linear;
-                    const double derivative = linear ? 1.0 :
-                        30 * phase * phase * (1 - phase) * (1 - phase);
-                    const double second = linear ? 0.0 :
-                        60 * phase * (1 - phase) * (1 - 2 * phase);
                     for (size_t joint = 0; joint < standing_motion::kArmJoints; ++joint) {
                         const double delta = segment.to[joint] - segment.from[joint];
-                        const double velocity = delta * derivative / segment.duration;
-                        const double acceleration = delta * second /
-                            (segment.duration * segment.duration);
+                        const double velocity = delta / segment.duration;
                         const double warped_velocity = velocity * (1 - u);
-                        const double warped_acceleration = acceleration * (1 - u) * (1 - u)
-                            - velocity / duration;
+                        const double warped_acceleration = -velocity / duration;
                         if (std::abs(warped_velocity) > max_velocity + 1e-6 ||
                             std::abs(warped_acceleration) > max_acceleration + 1e-6)
                             return false;
