@@ -225,7 +225,7 @@ int main() {
               << "  G1 Arm7 - 教学模式 (带命名)\n"
               << "  腰部全程锁定，手臂可自由拖动\n"
               << "  首帧=入口姿态，末帧=出口姿态；无需补neutral\n"
-              << "  Enter = 记录    q = 命名保存并退出\n"
+              << "  Enter = 记录    q = 命名保存并退出    c = 取消且不保存\n"
               << "===========================================\n\n";
 
     TotalQ q_init = get_total_q();
@@ -270,11 +270,16 @@ int main() {
     std::vector<ArmQ> waypoints;
     std::vector<double> intervals;
     std::string line;
+    bool save_requested = false;
 
     while (g_running.load()) {
-        std::cout << "[Enter]=记录  [q]=命名保存并退出 > " << std::flush;
+        std::cout << "[Enter]=记录  [q]=命名保存并退出  [c]=取消且不保存 > " << std::flush;
         if (!std::getline(std::cin, line)) break;
-        if (line == "q" || line == "Q") break;
+        if (line == "q" || line == "Q") {
+            save_requested = true;
+            break;
+        }
+        if (line == "c" || line == "C") break;
         ArmQ snap = get_arm_q();
         waypoints.push_back(snap);
         intervals.push_back(DEFAULT_SEG_DURATION);
@@ -293,6 +298,11 @@ int main() {
     TotalQ q_exit = get_total_q();
     for (int i = N_ARM; i < N_TOTAL; ++i) q_exit[i] = q_init[i];
     ramp_down(pub, cmd, ENGAGE_T, q_exit);
+
+    if (!save_requested) {
+        std::cout << "[CANCELLED] 本次录制未保存，已有动作文件和元数据未更改\n";
+        return 0;
+    }
 
     if (waypoints.empty()) {
         std::cout << "[WARN] 无 waypoint，未保存\n";
